@@ -6,9 +6,22 @@ RTK filters and summarises CLI output before it reaches the context window — f
 
 > Port of the [Claude Code hook](https://github.com/rtk-ai/rtk?tab=readme-ov-file#claude-code-hook) (`rtk-rewrite.sh`) for pi's extension system.
 
-## Install
+## Prerequisites
 
-**Prerequisite:** [Install RTK](https://github.com/rtk-ai/rtk#install) first.
+This extension requires **RTK** to be installed and available on your PATH.
+
+RTK is a high-performance CLI proxy that filters and summarises system outputs before they reach your LLM context. Without it, the rewritten commands will fail.
+
+👉 **[Install RTK](https://github.com/rtk-ai/rtk#install)** — see the [RTK repo](https://github.com/rtk-ai/rtk) for installation instructions, configuration, and the full list of supported commands.
+
+```bash
+# Verify rtk is installed
+rtk --version
+```
+
+If `rtk` is not found on PATH at startup, the extension disables itself with a warning.
+
+## Install
 
 ```bash
 # From git
