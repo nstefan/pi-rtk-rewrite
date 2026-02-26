@@ -1,6 +1,6 @@
 {
   "name": "pi-rtk-rewrite",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "RTK command rewriter for pi — transparently rewrites bash commands to their rtk equivalents for token-optimized LLM output",
   "type": "module",
   "license": "MIT",
