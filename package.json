@@ -1,0 +1,46 @@
+{
+  "name": "pi-rtk-rewrite",
+  "version": "0.1.0",
+  "description": "RTK command rewriter for pi — transparently rewrites bash commands to their rtk equivalents for token-optimized LLM output",
+  "type": "module",
+  "license": "MIT",
+  "author": "nstefan",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nstefan/pi-rtk-rewrite.git"
+  },
+  "homepage": "https://github.com/nstefan/pi-rtk-rewrite#readme",
+  "bugs": {
+    "url": "https://github.com/nstefan/pi-rtk-rewrite/issues"
+  },
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "pi",
+    "pi-coding-agent",
+    "rtk",
+    "token-optimization",
+    "context-window"
+  ],
+  "files": [
+    "extensions/rtk-rewrite.ts",
+    "README.md",
+    "LICENSE"
+  ],
+  "pi": {
+    "extensions": [
+      "./extensions/rtk-rewrite.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": ">=0.51.0"
+  },
+  "peerDependenciesMeta": {
+    "@mariozechner/pi-coding-agent": {
+      "optional": true
+    }
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
