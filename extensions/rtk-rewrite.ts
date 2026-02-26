@@ -465,6 +465,80 @@ function splitEnvPrefix(cmd: string): [envPrefix: string, body: string] {
   return ["", cmd];
 }
 
+// ── Safe suffix stripping ────────────────────────────────────────────────────
+//
+// Agents frequently emit commands with suffixes that trip hasPipeOrRedirect
+// but don't change the core command's stdout semantics:
+//
+//   ls dir/ 2>/dev/null || echo "NOT FOUND"    (stderr + fallback)
+//   git diff --stat | head -20                  (truncation)
+//   git log --oneline | tail -5                 (tail truncation)
+//
+// We strip these BEFORE the pipe/redirect check, attempt the rewrite on the
+// clean core, then re-append the suffix so shell behaviour is preserved.
+
+interface SuffixStrip {
+  /** The command with safe suffixes removed */
+  core: string;
+  /** Suffixes to re-append after rewrite (preserves shell semantics) */
+  suffix: string;
+}
+
+/**
+ * Strip safe suffixes that block hasPipeOrRedirect but don't affect
+ * the core command's rewritability.
+ *
+ * Stripping order (right-to-left, outermost suffix first):
+ *   1. `|| echo "..."` / `|| true` at end — error fallback (outermost)
+ *   2. `| head -N` / `| tail -N` at end   — output truncation
+ *   3. `2>/dev/null` / `2>&1` anywhere     — stderr redirect
+ *
+ * Ordering matters: `cmd | head -20 || true` must strip `|| true` first
+ * to expose the `| head -20` for step 2.
+ *
+ * All stripped suffixes are re-appended after the rtk rewrite so the
+ * final command has identical shell behaviour to the original.
+ */
+function stripSafeSuffixes(cmd: string): SuffixStrip {
+  let core = cmd;
+  const suffixes: string[] = [];
+
+  // 1. Strip `|| echo "..."`, `|| echo '...'`, or `|| true` at end
+  //    Uses greedy (.+) so when multiple || exist, picks the LAST one.
+  const orFallbackRe = /^(.+)\s*(\|\|\s*(?:echo\s+(?:"[^"]*"|'[^']*'|\S+)|true))\s*$/;
+  let m = core.match(orFallbackRe);
+  if (m) {
+    core = m[1].trimEnd();
+    suffixes.push(m[2].trim()); // rightmost position
+  }
+
+  // 2. Strip `| head -N` or `| tail -N` at end
+  //    Patterns: | head -50, | tail -5, | head -n 50, | tail --lines=10
+  //    Unshift so pipe-trunc appears BEFORE the fallback when reconstructed:
+  //    `rtk cmd | head -20 || true` (not `rtk cmd || true | head -20`)
+  const pipeTruncRe = /^(.+)\s*(\|\s*(?:head|tail)\s+(?:-\d+|-n\s*\d+|--lines=\d+))\s*$/;
+  m = core.match(pipeTruncRe);
+  if (m) {
+    core = m[1].trimEnd();
+    suffixes.unshift(m[2].trim()); // before fallback
+  }
+
+  // 3. Strip `2>/dev/null` and `2>&1` outside quotes.
+  //    Negative lookbehind prevents matching inside quoted strings like
+  //    `echo "2>/dev/null"` or `grep '2>&1' file`.
+  const stderrMatchRe = /(?<!['"\\])2>(?:\/dev\/null|&1)/g;
+  const stderrMatches = core.match(stderrMatchRe);
+  if (stderrMatches && stderrMatches.length > 0) {
+    core = core.replace(/\s*(?<!['"\\])2>(?:\/dev\/null|&1)\s*/g, " ").replace(/\s{2,}/g, " ").trim();
+    // Prepend stderr redirects (leftmost position in reconstructed command)
+    suffixes.unshift(...stderrMatches);
+  }
+
+  if (suffixes.length === 0) return { core, suffix: "" };
+
+  return { core, suffix: " " + suffixes.join(" ") };
+}
+
 interface RewriteResult {
   rewritten: string;
   rule: string;
@@ -479,20 +553,22 @@ function tryRewriteSingle(command: string): RewriteResult | null {
 
   const [envPrefix, body] = splitEnvPrefix(command);
 
+  // Strip safe suffixes (stderr redirects, error fallbacks, pipe truncation)
+  // before checking for unsafe pipes/redirects
+  const { core, suffix } = stripSafeSuffixes(body);
+
   // Skip commands with pipes, redirects, or subshells.
   // rtk adds summary/header lines (📊, 🔍) that break downstream
   // consumers like `| wc -l`, `| sort`, `| grep`, `> file`, etc.
-  if (hasPipeOrRedirect(body)) return null;
-
-  const matchTarget = body; // match against env-stripped command
+  if (hasPipeOrRedirect(core)) return null;
 
   for (const rule of rules) {
-    if (rule.match(matchTarget)) {
-      const rewrittenBody = rule.rewrite(body);
+    if (rule.match(core)) {
+      const rewrittenCore = rule.rewrite(core);
       // If the rewrite function didn't change anything, skip
-      if (rewrittenBody === body) continue;
+      if (rewrittenCore === core) continue;
       return {
-        rewritten: envPrefix + rewrittenBody,
+        rewritten: envPrefix + rewrittenCore + suffix,
         rule: rule.label,
       };
     }
