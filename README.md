@@ -40,11 +40,10 @@ The extension intercepts `bash` tool calls and rewrites the command before execu
 | **Git** | `git status/diff/log/add/commit/push/pull/branch/fetch/stash/show` | `rtk git …` |
 | **GitHub CLI** | `gh pr/issue/run/api/release` | `rtk gh …` |
 | **File ops** | `cat` | `rtk read` |
-| | `grep`, `rg` | `rtk grep` |
+| | `grep "pattern" file` | `rtk grep "pattern" file` |
 | | `ls` | `rtk ls` |
 | | `tree` | `rtk tree` |
-| | `find` | `rtk find` |
-| | `diff` | `rtk diff` |
+| | `diff file1 file2` | `rtk diff file1 file2` |
 | | `head -N file` | `rtk read file --max-lines N` |
 | **JS/TS** | `vitest`, `pnpm test` | `rtk vitest run` |
 | | `npm test`, `npm run` | `rtk npm …` |
@@ -66,12 +65,23 @@ The extension intercepts `bash` tool calls and rewrites the command before execu
 | | `golangci-lint` | `rtk golangci-lint` |
 | **pnpm** | `pnpm list/ls/outdated` | `rtk pnpm …` |
 
-### Skipped automatically
+### Safety rules — skipped automatically
 
-- Commands already using `rtk`
-- Heredocs (`<<`)
-- Commands with no matching rule (passed through unchanged)
-- Leading env-var assignments are preserved (`KEY=val git status` → `KEY=val rtk git status`)
+The extension is conservative about when to rewrite. Commands are **passed through unchanged** when:
+
+- **Pipes or redirects** — `grep pattern file | wc -l`, `ls > out.txt`, `diff <(a) <(b)`. RTK adds summary lines (📊, 🔍) that break downstream consumers like `wc -l`, `sort`, `head`, etc. The detector respects quotes (pipes inside `"..."` or `'...'` are argument content, not shell operators).
+
+- **Shell chaining** — `cmd1 && cmd2`, `cmd1 || cmd2`, subshells via `$()` or backticks.
+
+- **GNU find** — `rtk find` uses glob-based `<PATTERN> [PATH]` syntax which is fundamentally incompatible with GNU find's `<PATH> [EXPRESSION]` syntax. Options like `-name`, `-type`, `-exec`, `-path` have no rtk equivalents.
+
+- **Complex grep/rg** — Only simple `grep "pattern" file` or `grep -n "pattern" file` are rewritten. Any unsupported flags (`-r`, `-o`, `-P`, `-B`, `-A`, `-i`, `-c`, `-w`, `-v`, `--include`, `--exclude`, etc.) cause the rewrite to be skipped. This prevents errors from rtk grep's different argument parsing.
+
+- **Already using rtk** — commands starting with `rtk` are never double-rewritten.
+
+- **Heredocs** — commands containing `<<` are skipped.
+
+- **Leading env vars** — preserved: `KEY=val git status` → `KEY=val rtk git status`.
 
 ## Commands
 
@@ -85,8 +95,9 @@ The extension intercepts `bash` tool calls and rewrites the command before execu
 Pi's `tool_call` event fires before each tool execution. The extension:
 
 1. Checks if the tool is `bash` and the command matches a rewrite rule
-2. Mutates `event.input.command` with the `rtk`-prefixed version
-3. Pi executes the rewritten command — the agent sees compact output
+2. Verifies no pipes, redirects, or incompatible flags are present
+3. Mutates `event.input.command` with the `rtk`-prefixed version
+4. Pi executes the rewritten command — the agent sees compact output
 
 No network calls, no dependencies, no external processes spawned.
 
@@ -98,6 +109,9 @@ cd pi-rtk-rewrite
 
 # Test locally
 pi -e ./extensions/rtk-rewrite.ts
+
+# Run tests
+npx tsx test/rewrite.test.ts
 
 # Install from local path
 pi install ./
