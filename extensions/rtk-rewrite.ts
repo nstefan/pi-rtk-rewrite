@@ -470,7 +470,7 @@ interface RewriteResult {
   rule: string;
 }
 
-function tryRewrite(command: string): RewriteResult | null {
+function tryRewriteSingle(command: string): RewriteResult | null {
   // Skip if already using rtk
   if (/^rtk\s/.test(command) || /\/rtk\s/.test(command)) return null;
 
@@ -499,6 +499,103 @@ function tryRewrite(command: string): RewriteResult | null {
   }
 
   return null;
+}
+
+/**
+ * Shell control-flow keywords that indicate a structured script.
+ * When ANY logical line starts with one of these, we bail out of
+ * per-line rewriting — the command is a script, not a sequence of
+ * independent commands.
+ */
+const CONTROL_FLOW = new Set([
+  "for", "while", "until", "if", "then", "else", "elif", "fi",
+  "case", "esac", "do", "done", "select", "function", "{", "}",
+]);
+
+/**
+ * Merge physical lines that end with `\` (continuation) into logical lines.
+ * Preserves original line breaks inside each logical unit so the final
+ * reassembly produces an identical string when nothing is rewritten.
+ */
+function mergeContLines(lines: string[]): string[] {
+  const out: string[] = [];
+  let buf = "";
+  for (const ln of lines) {
+    if (ln.endsWith("\\")) {
+      buf += ln + "\n";
+    } else {
+      out.push(buf + ln);
+      buf = "";
+    }
+  }
+  if (buf) out.push(buf); // trailing continuation without final line
+  return out;
+}
+
+/**
+ * Try to rewrite a (possibly multi-line) bash command.
+ *
+ * LLMs frequently emit bash commands like:
+ *
+ *   # Check the files
+ *   git status
+ *   ls -la
+ *
+ * The original tryRewriteSingle sees `#` as the first word and skips the
+ * entire block. This wrapper splits by newlines, rewrites each independent
+ * command line, and reassembles.
+ */
+function tryRewrite(command: string): RewriteResult | null {
+  // Fast path: single-line commands (most common)
+  if (!command.includes("\n")) {
+    return tryRewriteSingle(command);
+  }
+
+  // Global heredoc check — if the whole command has `<<`, bail out.
+  // (Lines inside the heredoc body could false-match rules.)
+  if (command.includes("<<")) return null;
+
+  const rawLines = command.split("\n");
+  const logical = mergeContLines(rawLines);
+
+  // Safety: if any line starts with a control-flow keyword, this is a
+  // structured script — don't attempt per-line rewriting.
+  for (const ln of logical) {
+    const fw = ln.trimStart().split(/\s+/)[0] ?? "";
+    if (CONTROL_FLOW.has(fw)) return null;
+  }
+
+  const rewrittenLines: string[] = [];
+  let anyRewritten = false;
+  const hitRules: string[] = [];
+
+  for (const ln of logical) {
+    const trimmed = ln.trimStart();
+
+    // Preserve comments and blank lines as-is
+    if (trimmed === "" || trimmed.startsWith("#")) {
+      rewrittenLines.push(ln);
+      continue;
+    }
+
+    const result = tryRewriteSingle(trimmed);
+    if (result) {
+      // Preserve leading whitespace (indentation)
+      const indent = ln.slice(0, ln.length - ln.trimStart().length);
+      rewrittenLines.push(indent + result.rewritten);
+      anyRewritten = true;
+      if (!hitRules.includes(result.rule)) hitRules.push(result.rule);
+    } else {
+      rewrittenLines.push(ln);
+    }
+  }
+
+  if (!anyRewritten) return null;
+
+  return {
+    rewritten: rewrittenLines.join("\n"),
+    rule: hitRules.join(", "),
+  };
 }
 
 // ── Extension entry point ────────────────────────────────────────────────────
@@ -543,7 +640,7 @@ export default function (pi: ExtensionAPI) {
 
     // Mutate the command in-place (same pattern as @agentlogs/pi and @aliou/pi-toolchain)
     event.input.command = result.rewritten;
-    stats.byRule[result.label] = (stats.byRule[result.label] ?? 0) + 1;
+    stats.byRule[result.rule] = (stats.byRule[result.rule] ?? 0) + 1;
   });
 
   // /rtk — show rewrite stats
