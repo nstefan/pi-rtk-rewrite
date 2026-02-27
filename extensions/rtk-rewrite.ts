@@ -7,6 +7,7 @@
  * tokens without changing semantics.
  *
  * Port of ~/.claude/hooks/rtk-rewrite.sh for pi's extension system.
+ * Matches Claude hook behavior: aggressive rewriting, no pipe/redirect guards.
  *
  * Install:
  *   pi install git:github.com/nstefan/pi-rtk-rewrite
@@ -29,7 +30,7 @@ import { execSync } from "node:child_process";
 interface RewriteRule {
   /** Human-readable label for stats */
   label: string;
-  /** Test whether the (env-stripped) command matches */
+  /** Test whether the command matches */
   match: (cmd: string) => boolean;
   /** Produce the rewritten command body (without env prefix) */
   rewrite: (cmdBody: string) => string;
@@ -101,80 +102,9 @@ function re(pattern: RegExp): (cmd: string) => boolean {
   return (cmd) => pattern.test(cmd);
 }
 
-/**
- * Check if a command contains shell pipeline operators, process substitution,
- * subshells, or output redirection. These make rtk rewriting unsafe because
- * rtk adds summary lines (📊, 🔍) that break downstream consumers like
- * `| wc -l`, `| sort`, `| grep`, `> file`, etc.
- *
- * We only check for unquoted operators — those inside single/double quotes
- * are part of arguments, not shell syntax.
- */
-function hasPipeOrRedirect(cmd: string): boolean {
-  // Quick check for common operators before doing expensive parsing
-  if (!/[|><`$]/.test(cmd) && !cmd.includes("&&") && !cmd.includes("||")) {
-    return false;
-  }
-
-  // Walk the command character by character, tracking quote state
-  let inSingle = false;
-  let inDouble = false;
-  let escaped = false;
-
-  for (let i = 0; i < cmd.length; i++) {
-    const ch = cmd[i];
-    const next = cmd[i + 1];
-
-    if (escaped) {
-      escaped = false;
-      continue;
-    }
-
-    if (ch === "\\") {
-      escaped = true;
-      continue;
-    }
-
-    if (ch === "'" && !inDouble) {
-      inSingle = !inSingle;
-      continue;
-    }
-
-    if (ch === '"' && !inSingle) {
-      inDouble = !inDouble;
-      continue;
-    }
-
-    // Inside quotes — skip operator detection
-    if (inSingle || inDouble) continue;
-
-    // Pipe: |  (but not ||)
-    if (ch === "|" && next !== "|") return true;
-
-    // Output redirection: >, >>, 2>, &>
-    if (ch === ">" && next !== "&") return true;
-    // Input redirection with process substitution: <(
-    if (ch === "<" && next === "(") return true;
-
-    // Backtick subshell
-    if (ch === "`") return true;
-
-    // $() subshell
-    if (ch === "$" && next === "(") return true;
-
-    // && and || chain operators (downstream command depends on output)
-    if (ch === "&" && next === "&") return true;
-    if (ch === "|" && next === "|") return true;
-  }
-
-  return false;
-}
-
 // ── Rewrite Rules ────────────────────────────────────────────────────────────
 // Each rule is tested in order; the first match wins.
-//
-// SAFETY PRINCIPLE: Only rewrite when rtk is a drop-in replacement.
-// Skip if the command uses flags/syntax that rtk doesn't support.
+// Matches Claude CLI hook behavior: aggressive rewriting for maximum token savings.
 
 const GIT_SUBCMDS = new Set([
   "status", "diff", "log", "add", "commit", "push",
@@ -192,45 +122,6 @@ const DOCKER_SIMPLE_SUBCMDS = new Set([
 const KUBECTL_SUBCMDS = new Set([
   "get", "logs", "describe", "apply",
 ]);
-
-/**
- * Flags that rtk grep does NOT support (GNU grep / ripgrep flags that
- * conflict with rtk's own argument parsing or have no equivalent).
- * When any of these appear before the pattern, we skip the rewrite.
- *
- * rtk grep only supports: -n (line numbers, compat), -m (max results),
- * -l (max line length), -c (context-only), -t (file type), -v (verbose).
- * Of these, -c/-v/-l mean different things in GNU grep, so they're unsafe.
- *
- * Strategy: block ANY single-char flag except -n (the only safe overlap).
- * Also block all long-form GNU grep flags.
- */
-const GREP_UNSAFE_FLAGS = /(?:^|\s)(-[A-Za-z]*[^n\s]|--include|--exclude|--only-matching|--perl-regexp|--extended-regexp|--files-with|--files-without|--count|--word-regexp|--invert-match|--line-regexp|--null|--recursive|--binary|--text|--color|--max-count|--after-context|--before-context|--context)/;
-
-/**
- * True when a grep/rg command is simple enough to safely rewrite.
- * Simple = no unsupported flags before the pattern argument.
- *
- * Safe patterns:
- *   grep "pattern" file
- *   grep -n "pattern" file     (rtk grep always shows line numbers)
- *   rg "pattern" path
- *
- * Unsafe patterns:
- *   grep -rn "pattern" dir/
- *   grep -oP "regex" file
- *   grep -B5 -A5 "pattern" file
- *   grep --include="*.gd" "pattern" dir/
- */
-function isSimpleGrep(cmd: string): boolean {
-  // Strip the command name
-  const args = cmd.replace(/^(rg|grep)\s+/, "");
-
-  // If there are any unsupported flags, bail
-  if (GREP_UNSAFE_FLAGS.test(args)) return false;
-
-  return true;
-}
 
 const rules: RewriteRule[] = [
   // ── Git ──────────────────────────────────────────────────────────────────
@@ -264,14 +155,9 @@ const rules: RewriteRule[] = [
     match: re(/^cat\s+/),
     rewrite: (body) => body.replace(/^cat /, "rtk read "),
   },
-  //
-  // grep/rg: ONLY rewrite simple invocations without unsupported flags.
-  // rtk grep uses `<PATTERN> [PATH] [EXTRA_ARGS]...` syntax which is
-  // incompatible with GNU grep's flag-heavy style (-rn, -oP, -B/-A, --include).
-  //
   {
     label: "grep/rg",
-    match: (cmd) => re(/^(rg|grep)\s+/)(cmd) && isSimpleGrep(cmd),
+    match: re(/^(rg|grep)\s+/),
     rewrite: (body) => body.replace(/^(rg|grep) /, "rtk grep "),
   },
   {
@@ -284,11 +170,11 @@ const rules: RewriteRule[] = [
     match: re(/^tree(\s|$)/),
     rewrite: (body) => body.replace(/^tree/, "rtk tree"),
   },
-  //
-  // find: REMOVED — rtk find uses `<PATTERN> [PATH]` glob syntax which is
-  // fundamentally incompatible with GNU find's `<PATH> [EXPRESSION]` syntax.
-  // Options like -name, -type, -exec, -path, -maxdepth have no equivalents.
-  //
+  {
+    label: "find",
+    match: re(/^find\s+/),
+    rewrite: (body) => body.replace(/^find /, "rtk find "),
+  },
   {
     label: "diff",
     match: re(/^diff\s+/),
@@ -465,80 +351,6 @@ function splitEnvPrefix(cmd: string): [envPrefix: string, body: string] {
   return ["", cmd];
 }
 
-// ── Safe suffix stripping ────────────────────────────────────────────────────
-//
-// Agents frequently emit commands with suffixes that trip hasPipeOrRedirect
-// but don't change the core command's stdout semantics:
-//
-//   ls dir/ 2>/dev/null || echo "NOT FOUND"    (stderr + fallback)
-//   git diff --stat | head -20                  (truncation)
-//   git log --oneline | tail -5                 (tail truncation)
-//
-// We strip these BEFORE the pipe/redirect check, attempt the rewrite on the
-// clean core, then re-append the suffix so shell behaviour is preserved.
-
-interface SuffixStrip {
-  /** The command with safe suffixes removed */
-  core: string;
-  /** Suffixes to re-append after rewrite (preserves shell semantics) */
-  suffix: string;
-}
-
-/**
- * Strip safe suffixes that block hasPipeOrRedirect but don't affect
- * the core command's rewritability.
- *
- * Stripping order (right-to-left, outermost suffix first):
- *   1. `|| echo "..."` / `|| true` at end — error fallback (outermost)
- *   2. `| head -N` / `| tail -N` at end   — output truncation
- *   3. `2>/dev/null` / `2>&1` anywhere     — stderr redirect
- *
- * Ordering matters: `cmd | head -20 || true` must strip `|| true` first
- * to expose the `| head -20` for step 2.
- *
- * All stripped suffixes are re-appended after the rtk rewrite so the
- * final command has identical shell behaviour to the original.
- */
-function stripSafeSuffixes(cmd: string): SuffixStrip {
-  let core = cmd;
-  const suffixes: string[] = [];
-
-  // 1. Strip `|| echo "..."`, `|| echo '...'`, or `|| true` at end
-  //    Uses greedy (.+) so when multiple || exist, picks the LAST one.
-  const orFallbackRe = /^(.+)\s*(\|\|\s*(?:echo\s+(?:"[^"]*"|'[^']*'|\S+)|true))\s*$/;
-  let m = core.match(orFallbackRe);
-  if (m) {
-    core = m[1].trimEnd();
-    suffixes.push(m[2].trim()); // rightmost position
-  }
-
-  // 2. Strip `| head -N` or `| tail -N` at end
-  //    Patterns: | head -50, | tail -5, | head -n 50, | tail --lines=10
-  //    Unshift so pipe-trunc appears BEFORE the fallback when reconstructed:
-  //    `rtk cmd | head -20 || true` (not `rtk cmd || true | head -20`)
-  const pipeTruncRe = /^(.+)\s*(\|\s*(?:head|tail)\s+(?:-\d+|-n\s*\d+|--lines=\d+))\s*$/;
-  m = core.match(pipeTruncRe);
-  if (m) {
-    core = m[1].trimEnd();
-    suffixes.unshift(m[2].trim()); // before fallback
-  }
-
-  // 3. Strip `2>/dev/null` and `2>&1` outside quotes.
-  //    Negative lookbehind prevents matching inside quoted strings like
-  //    `echo "2>/dev/null"` or `grep '2>&1' file`.
-  const stderrMatchRe = /(?<!['"\\])2>(?:\/dev\/null|&1)/g;
-  const stderrMatches = core.match(stderrMatchRe);
-  if (stderrMatches && stderrMatches.length > 0) {
-    core = core.replace(/\s*(?<!['"\\])2>(?:\/dev\/null|&1)\s*/g, " ").replace(/\s{2,}/g, " ").trim();
-    // Prepend stderr redirects (leftmost position in reconstructed command)
-    suffixes.unshift(...stderrMatches);
-  }
-
-  if (suffixes.length === 0) return { core, suffix: "" };
-
-  return { core, suffix: " " + suffixes.join(" ") };
-}
-
 interface RewriteResult {
   rewritten: string;
   rule: string;
@@ -548,27 +360,18 @@ function tryRewriteSingle(command: string): RewriteResult | null {
   // Skip if already using rtk
   if (/^rtk\s/.test(command) || /\/rtk\s/.test(command)) return null;
 
-  // Skip heredocs
+  // Skip heredocs (Claude hook does this too)
   if (command.includes("<<")) return null;
 
   const [envPrefix, body] = splitEnvPrefix(command);
 
-  // Strip safe suffixes (stderr redirects, error fallbacks, pipe truncation)
-  // before checking for unsafe pipes/redirects
-  const { core, suffix } = stripSafeSuffixes(body);
-
-  // Skip commands with pipes, redirects, or subshells.
-  // rtk adds summary/header lines (📊, 🔍) that break downstream
-  // consumers like `| wc -l`, `| sort`, `| grep`, `> file`, etc.
-  if (hasPipeOrRedirect(core)) return null;
-
   for (const rule of rules) {
-    if (rule.match(core)) {
-      const rewrittenCore = rule.rewrite(core);
+    if (rule.match(body)) {
+      const rewrittenBody = rule.rewrite(body);
       // If the rewrite function didn't change anything, skip
-      if (rewrittenCore === core) continue;
+      if (rewrittenBody === body) continue;
       return {
-        rewritten: envPrefix + rewrittenCore + suffix,
+        rewritten: envPrefix + rewrittenBody,
         rule: rule.label,
       };
     }
@@ -576,17 +379,6 @@ function tryRewriteSingle(command: string): RewriteResult | null {
 
   return null;
 }
-
-/**
- * Shell control-flow keywords that indicate a structured script.
- * When ANY logical line starts with one of these, we bail out of
- * per-line rewriting — the command is a script, not a sequence of
- * independent commands.
- */
-const CONTROL_FLOW = new Set([
-  "for", "while", "until", "if", "then", "else", "elif", "fi",
-  "case", "esac", "do", "done", "select", "function", "{", "}",
-]);
 
 /**
  * Merge physical lines that end with `\` (continuation) into logical lines.
@@ -633,13 +425,6 @@ function tryRewrite(command: string): RewriteResult | null {
 
   const rawLines = command.split("\n");
   const logical = mergeContLines(rawLines);
-
-  // Safety: if any line starts with a control-flow keyword, this is a
-  // structured script — don't attempt per-line rewriting.
-  for (const ln of logical) {
-    const fw = ln.trimStart().split(/\s+/)[0] ?? "";
-    if (CONTROL_FLOW.has(fw)) return null;
-  }
 
   const rewrittenLines: string[] = [];
   let anyRewritten = false;
@@ -714,7 +499,7 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
-    // Mutate the command in-place (same pattern as @agentlogs/pi and @aliou/pi-toolchain)
+    // Mutate the command in-place
     event.input.command = result.rewritten;
     stats.byRule[result.rule] = (stats.byRule[result.rule] ?? 0) + 1;
   });

@@ -1,7 +1,7 @@
 {
   "name": "pi-rtk-rewrite",
-  "version": "0.4.0",
-  "description": "RTK command rewriter for pi — transparently rewrites bash commands to their rtk equivalents for token-optimized LLM output",
+  "version": "0.5.0",
+  "description": "RTK command rewriter for pi — faithful port of the Claude Code rtk-rewrite.sh hook for aggressive token-optimized LLM output",
   "type": "module",
   "license": "MIT",
   "author": "nstefan",

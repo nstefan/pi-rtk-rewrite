@@ -4,7 +4,7 @@ A [pi coding agent](https://github.com/badlogic/pi-mono) extension that transpar
 
 RTK filters and summarises CLI output before it reaches the context window — fewer tokens, same semantics. This extension makes it automatic: the agent writes normal commands, the extension silently rewrites them to use `rtk`.
 
-> Port of the [Claude Code hook](https://github.com/rtk-ai/rtk?tab=readme-ov-file#claude-code-hook) (`rtk-rewrite.sh`) for pi's extension system.
+> **Faithful port** of the [Claude Code hook](https://github.com/rtk-ai/rtk?tab=readme-ov-file#claude-code-hook) (`rtk-rewrite.sh`) for pi's extension system. Same aggressive rewriting behavior — maximum token savings.
 
 ## Prerequisites
 
@@ -40,9 +40,10 @@ The extension intercepts `bash` tool calls and rewrites the command before execu
 | **Git** | `git status/diff/log/add/commit/push/pull/branch/fetch/stash/show` | `rtk git …` |
 | **GitHub CLI** | `gh pr/issue/run/api/release` | `rtk gh …` |
 | **File ops** | `cat` | `rtk read` |
-| | `grep "pattern" file` | `rtk grep "pattern" file` |
+| | `grep`, `rg` (all flags) | `rtk grep` |
 | | `ls` | `rtk ls` |
 | | `tree` | `rtk tree` |
+| | `find` | `rtk find` |
 | | `diff file1 file2` | `rtk diff file1 file2` |
 | | `head -N file` | `rtk read file --max-lines N` |
 | **JS/TS** | `vitest`, `pnpm test` | `rtk vitest run` |
@@ -65,23 +66,26 @@ The extension intercepts `bash` tool calls and rewrites the command before execu
 | | `golangci-lint` | `rtk golangci-lint` |
 | **pnpm** | `pnpm list/ls/outdated` | `rtk pnpm …` |
 
-### Safety rules — skipped automatically
+### What gets skipped
 
-The extension is conservative about when to rewrite. Commands are **passed through unchanged** when:
-
-- **Pipes or redirects** — `grep pattern file | wc -l`, `ls > out.txt`, `diff <(a) <(b)`. RTK adds summary lines (📊, 🔍) that break downstream consumers like `wc -l`, `sort`, `head`, etc. The detector respects quotes (pipes inside `"..."` or `'...'` are argument content, not shell operators).
-
-- **Shell chaining** — `cmd1 && cmd2`, `cmd1 || cmd2`, subshells via `$()` or backticks.
-
-- **GNU find** — `rtk find` uses glob-based `<PATTERN> [PATH]` syntax which is fundamentally incompatible with GNU find's `<PATH> [EXPRESSION]` syntax. Options like `-name`, `-type`, `-exec`, `-path` have no rtk equivalents.
-
-- **Complex grep/rg** — Only simple `grep "pattern" file` or `grep -n "pattern" file` are rewritten. Any unsupported flags (`-r`, `-o`, `-P`, `-B`, `-A`, `-i`, `-c`, `-w`, `-v`, `--include`, `--exclude`, etc.) cause the rewrite to be skipped. This prevents errors from rtk grep's different argument parsing.
+Minimal skip rules — matches Claude hook behavior:
 
 - **Already using rtk** — commands starting with `rtk` are never double-rewritten.
-
-- **Heredocs** — commands containing `<<` are skipped.
-
+- **Heredocs** — commands containing `<<` are skipped (same as Claude hook).
 - **Leading env vars** — preserved: `KEY=val git status` → `KEY=val rtk git status`.
+
+Pipes, redirects, and chained commands (`&&`, `||`) are **rewritten through** — matching the Claude hook's aggressive behavior for maximum token savings.
+
+### Multi-line commands (pi advantage)
+
+Unlike the Claude hook which treats the entire command as a single string, this extension handles multi-line bash blocks by rewriting each independent line:
+
+```
+# Comment preserved
+git status          → rtk git status
+echo separator      → echo separator (no rule)
+ls -la              → rtk ls -la
+```
 
 ## Commands
 
@@ -95,9 +99,8 @@ The extension is conservative about when to rewrite. Commands are **passed throu
 Pi's `tool_call` event fires before each tool execution. The extension:
 
 1. Checks if the tool is `bash` and the command matches a rewrite rule
-2. Verifies no pipes, redirects, or incompatible flags are present
-3. Mutates `event.input.command` with the `rtk`-prefixed version
-4. Pi executes the rewritten command — the agent sees compact output
+2. Mutates `event.input.command` with the `rtk`-prefixed version
+3. Pi executes the rewritten command — the agent sees compact output
 
 No network calls, no dependencies, no external processes spawned.
 
