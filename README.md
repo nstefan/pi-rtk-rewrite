@@ -1,39 +1,31 @@
 # pi-rtk-rewrite
 
-A [pi coding agent](https://github.com/badlogic/pi-mono) extension that transparently rewrites bash commands to their [RTK](https://github.com/rtk-ai/rtk) equivalents for token-optimized LLM output.
+A [pi](https://github.com/badlogic/pi-mono) extension that intercepts `bash` tool calls and rewrites them to [RTK](https://github.com/rtk-ai/rtk) equivalents — the agent writes normal commands, the extension silently prefixes them with `rtk` before execution.
 
-RTK filters and summarises CLI output before it reaches the context window — fewer tokens, same semantics. This extension makes it automatic: the agent writes normal commands, the extension silently rewrites them to use `rtk`.
-
-> **Faithful port** of the [Claude Code hook](https://github.com/rtk-ai/rtk?tab=readme-ov-file#claude-code-hook) (`rtk-rewrite.sh`) for pi's extension system. Same aggressive rewriting behavior — maximum token savings.
-
-## Prerequisites
-
-This extension requires **RTK** to be installed and available on your PATH.
-
-RTK is a high-performance CLI proxy that filters and summarises system outputs before they reach your LLM context. Without it, the rewritten commands will fail.
-
-👉 **[Install RTK](https://github.com/rtk-ai/rtk#install)** — see the [RTK repo](https://github.com/rtk-ai/rtk) for installation instructions, configuration, and the full list of supported commands.
-
-```bash
-# Verify rtk is installed
-rtk --version
-```
-
-If `rtk` is not found on PATH at startup, the extension disables itself with a warning.
+> Port of the [Claude Code hook](https://github.com/rtk-ai/rtk?tab=readme-ov-file#claude-code-hook) (`rtk-rewrite.sh`) for pi's extension system.
 
 ## Install
 
+Requires [RTK](https://github.com/rtk-ai/rtk#install) on PATH. Disables itself with a warning if not found.
+
 ```bash
-# From git
-pi install git:github.com/nstefan/pi-rtk-rewrite
+pi install git:github.com/nstfn/pi-rtk-rewrite
 
 # Or try without installing
-pi -e git:github.com/nstefan/pi-rtk-rewrite
+pi -e git:github.com/nstfn/pi-rtk-rewrite
 ```
 
-## What gets rewritten
+## How it works
 
-The extension intercepts `bash` tool calls and rewrites the command before execution. If `rtk` is not on PATH, the extension disables itself with a warning.
+Pi fires a `tool_call` event before each tool execution. The extension:
+
+1. Checks if the tool is `bash` and the command matches a rewrite rule
+2. Mutates `event.input.command` in-place with the `rtk`-prefixed version
+3. Pi executes the rewritten command — the agent sees compact output
+
+No network calls, no dependencies, no spawned processes.
+
+### What gets rewritten
 
 | Category | Commands | Rewrite |
 |----------|----------|---------|
@@ -66,19 +58,16 @@ The extension intercepts `bash` tool calls and rewrites the command before execu
 | | `golangci-lint` | `rtk golangci-lint` |
 | **pnpm** | `pnpm list/ls/outdated` | `rtk pnpm …` |
 
-### What gets skipped
+### Skip rules
 
-Minimal skip rules — matches Claude hook behavior:
+- Commands starting with `rtk` — never double-rewritten
+- Heredocs (`<<`) — skipped entirely
+- Leading env vars — preserved: `KEY=val git status` → `KEY=val rtk git status`
+- Pipes, redirects, `&&`/`||` — rewritten through (aggressive, matches Claude hook)
 
-- **Already using rtk** — commands starting with `rtk` are never double-rewritten.
-- **Heredocs** — commands containing `<<` are skipped (same as Claude hook).
-- **Leading env vars** — preserved: `KEY=val git status` → `KEY=val rtk git status`.
+### Multi-line commands
 
-Pipes, redirects, and chained commands (`&&`, `||`) are **rewritten through** — matching the Claude hook's aggressive behavior for maximum token savings.
-
-### Multi-line commands (pi advantage)
-
-Unlike the Claude hook which treats the entire command as a single string, this extension handles multi-line bash blocks by rewriting each independent line:
+Unlike the Claude hook which treats the entire command as a single string, this extension rewrites each line independently:
 
 ```
 # Comment preserved
@@ -87,22 +76,60 @@ echo separator      → echo separator (no rule)
 ls -la              → rtk ls -la
 ```
 
+## Real-world results
+
+Tested live inside a pi session (Godot 4.6 project, ~1,400 bash tool calls tracked):
+
+| Metric | Value |
+|--------|-------|
+| Total commands tracked | 1,418 |
+| Input tokens | 5.5M |
+| Output tokens | 1.9M |
+| **Tokens saved** | **3.6M (65.7%)** |
+| Avg exec overhead | 308ms |
+
+Top savers: `cargo test` (1.1M saved, 99.8%), `cargo clippy` (948K, 99.1%), `ls` (571K across 655 calls), `git commit` (156K, 97.3%).
+
+### Verified rewrites
+
+Each row tested live — the extension intercepted the bash tool call and rtk produced compact output:
+
+| Pi bash tool call | Rewritten to | Result |
+|-------------------|-------------|--------|
+| `ls -la` | `rtk ls -la` | ✅ Compact output with file sizes + summary |
+| `cat project.godot` | `rtk read project.godot` | ✅ |
+| `tree scenes/ -L 1` | `rtk tree scenes/ -L 1` | ✅ |
+| `head -5 DESIGN.md` | `rtk read DESIGN.md --max-lines 5` | ✅ |
+| `git status` | `rtk git status` | ✅ One-line compact output |
+| `git log --oneline -5` | `rtk git log --oneline -5` | ✅ |
+| `git diff --stat HEAD~1` | `rtk git diff --stat HEAD~1` | ✅ |
+| `grep "extends" file.gd` | `rtk grep "extends" file.gd` | ✅ Formatted with file grouping |
+| `curl -s <url>` | `rtk curl -s <url>` | ✅ Compact JSON |
+| `FOO=bar git status` | `FOO=bar rtk git status` | ✅ Env prefix preserved |
+| `rtk gain` | `rtk gain` (unchanged) | ✅ No double-rewrite |
+| `echo`, `pwd`, `wc` | unchanged | ✅ Correctly passed through |
+| Multi-line block | Each line rewritten independently | ✅ Comments preserved |
+
+## Known limitations
+
+The extension rewrites correctly in all cases below — the errors come from flag-syntax mismatches between native CLI tools and their `rtk` equivalents:
+
+| Pi bash tool call | Issue | Workaround |
+|-------------------|-------|------------|
+| `grep -rn "pattern" dir/` | `rtk grep` doesn't accept `-r`, `-n`, or combined flags like `-rn` | Use positional syntax: `grep "pattern" dir/` (rtk searches recursively by default) |
+| `find . -name "*.ts" -maxdepth 2` | `rtk find` uses `<PATTERN> [PATH]` positional syntax, not `-name`/`-type` flags | Use `find "*.ts" .` or prefix with `command find` to bypass |
+| `grep -oP`, `-B`, `--include` | Flags passed through but `rtk grep` may not support all of them | Use `command grep` to bypass, or check `rtk grep --help` |
+
+To bypass rewriting for a specific command:
+- Prefix with `command`: `command grep -rn "pattern" dir/`
+- Use `/rtk:toggle` to temporarily disable all rewriting
+
 ## Commands
 
 | Command | Description |
 |---------|-------------|
 | `/rtk` | Show rewrite stats for the current session |
 | `/rtk:toggle` | Enable/disable rewriting on the fly |
-
-## How it works
-
-Pi's `tool_call` event fires before each tool execution. The extension:
-
-1. Checks if the tool is `bash` and the command matches a rewrite rule
-2. Mutates `event.input.command` with the `rtk`-prefixed version
-3. Pi executes the rewritten command — the agent sees compact output
-
-No network calls, no dependencies, no external processes spawned.
 
 ## Development
 
