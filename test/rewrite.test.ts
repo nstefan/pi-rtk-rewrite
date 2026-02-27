@@ -87,15 +87,180 @@ function kubectlSubcmd(cmd: string): string {
     .split(/\s+/)[0] ?? "";
 }
 
+// ── Smart translators (mirrored from extension) ─────────────────────────────
+
+function shellTokenise(input: string): string[] {
+  const tokens: string[] = [];
+  let current = "";
+  let quote: string | null = null;
+
+  for (let i = 0; i < input.length; i++) {
+    const ch = input[i];
+    if (quote) {
+      if (ch === quote) {
+        quote = null;
+      } else {
+        current += ch;
+      }
+    } else if (ch === '"' || ch === "'") {
+      quote = ch;
+    } else if (ch === " " || ch === "\t") {
+      if (current) {
+        tokens.push(current);
+        current = "";
+      }
+    } else {
+      current += ch;
+    }
+  }
+  if (current) tokens.push(current);
+  return tokens;
+}
+
+function splitAtShellOp(cmd: string): [string, string] {
+  let quote: string | null = null;
+  for (let i = 0; i < cmd.length; i++) {
+    const ch = cmd[i];
+    if (quote) {
+      if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'") { quote = ch; continue; }
+    if (ch === "|" || ch === ";" || ch === ">" || ch === "<") {
+      return [cmd.slice(0, i).trimEnd(), " " + cmd.slice(i)];
+    }
+    if (ch === "&" && cmd[i + 1] === "&") {
+      return [cmd.slice(0, i).trimEnd(), " " + cmd.slice(i)];
+    }
+  }
+  return [cmd, ""];
+}
+
+
+function translateGrep(body: string): string | null {
+  const [cmdPart, shellTail] = splitAtShellOp(body);
+
+  const rest = cmdPart.replace(/^(rg|grep)\s+/, "");
+  if (!rest) return null;
+
+  const tokens = shellTokenise(rest);
+
+  let pattern: string | null = null;
+  let path: string | null = null;
+  const extraArgs: string[] = [];
+
+  const stripShort = new Set(["r", "R"]);
+  const argFlags = new Set(["-A", "-B", "-C", "-m", "-e", "-f", "--glob"]);
+
+  for (let i = 0; i < tokens.length; i++) {
+    const tok = tokens[i];
+
+    if (/^-[a-zA-Z]{2,}$/.test(tok) && !tok.startsWith("--")) {
+      const kept = tok.slice(1).split("").filter((ch) => !stripShort.has(ch));
+      if (kept.length > 0) extraArgs.push("-" + kept.join(""));
+      continue;
+    }
+
+    if (tok === "-r" || tok === "-R" || tok === "--recursive") continue;
+
+    const includeMatch = tok.match(/^--include=(.+)$/);
+    if (includeMatch) {
+      extraArgs.push("--glob", includeMatch[1]);
+      continue;
+    }
+    if (tok === "--include" && i + 1 < tokens.length) {
+      extraArgs.push("--glob", tokens[++i]);
+      continue;
+    }
+
+    if (argFlags.has(tok) && i + 1 < tokens.length) {
+      extraArgs.push(tok, tokens[++i]);
+      continue;
+    }
+
+    if (tok.startsWith("-")) {
+      extraArgs.push(tok);
+      continue;
+    }
+
+    if (pattern === null) {
+      pattern = tok;
+    } else if (path === null) {
+      path = tok;
+    } else {
+      return null;
+    }
+  }
+
+  if (!pattern) return null;
+
+  const parts = ["rtk grep", pattern];
+  if (path) parts.push(path);
+  if (extraArgs.length > 0) parts.push(extraArgs.join(" "));
+  return parts.join(" ") + shellTail;
+}
+
+function translateFind(body: string): string | null {
+  const [cmdPart, shellTail] = splitAtShellOp(body);
+
+  const rest = cmdPart.replace(/^find\s+/, "");
+  if (!rest) return null;
+
+  const tokens = shellTokenise(rest);
+
+  const dangerous = new Set(["-exec", "-execdir", "-delete", "-print0", "-ok", "-fls", "-fprint"]);
+  if (tokens.some((t) => dangerous.has(t))) return null;
+
+  let namePattern: string | null = null;
+  let path: string | null = null;
+  let fileType: string | null = null;
+
+  const skipWithArg = new Set(["-maxdepth", "-mindepth"]);
+
+  for (let i = 0; i < tokens.length; i++) {
+    const tok = tokens[i];
+
+    if (tok === "-name" || tok === "-iname") {
+      if (i + 1 < tokens.length) namePattern = tokens[++i];
+      continue;
+    }
+
+    if (tok === "-type" && i + 1 < tokens.length) {
+      fileType = tokens[++i];
+      continue;
+    }
+
+    if (skipWithArg.has(tok) && i + 1 < tokens.length) {
+      i++;
+      continue;
+    }
+
+    if (tok.startsWith("-")) return null;
+
+    if (path === null) {
+      path = tok;
+    }
+  }
+
+  if (!namePattern) return null;
+
+  const parts = ["rtk find", namePattern];
+  if (path) parts.push(path);
+  if (fileType === "f" || fileType === "d") parts.push("-t", fileType);
+  return parts.join(" ") + shellTail;
+}
+
+// ── Rules ────────────────────────────────────────────────────────────────────
+
 const rules: RewriteRule[] = [
   { label: "git", match: (cmd) => re(/^git\s/)(cmd) && GIT_SUBCMDS.has(gitSubcmd(cmd)), rewrite: (body) => `rtk ${body}` },
   { label: "gh", match: re(/^gh\s+(pr|issue|run|api|release)(\s|$)/), rewrite: (body) => body.replace(/^gh /, "rtk gh ") },
   { label: "cargo", match: (cmd) => { if (!re(/^cargo\s/)(cmd)) return false; const sub = cmd.replace(/^cargo\s+(\+\S+\s+)?/, "").split(/\s+/)[0] ?? ""; return CARGO_SUBCMDS.has(sub); }, rewrite: (body) => `rtk ${body}` },
   { label: "cat → rtk read", match: re(/^cat\s+/), rewrite: (body) => body.replace(/^cat /, "rtk read ") },
-  { label: "grep/rg", match: re(/^(rg|grep)\s+/), rewrite: (body) => body.replace(/^(rg|grep) /, "rtk grep ") },
+  { label: "grep/rg", match: re(/^(rg|grep)\s+/), rewrite: (body) => translateGrep(body) ?? body },
   { label: "ls", match: re(/^ls(\s|$)/), rewrite: (body) => body.replace(/^ls/, "rtk ls") },
   { label: "tree", match: re(/^tree(\s|$)/), rewrite: (body) => body.replace(/^tree/, "rtk tree") },
-  { label: "find", match: re(/^find\s+/), rewrite: (body) => body.replace(/^find /, "rtk find ") },
+  { label: "find", match: re(/^find\s+/), rewrite: (body) => translateFind(body) ?? body },
   { label: "diff", match: re(/^diff\s+/), rewrite: (body) => body.replace(/^diff /, "rtk diff ") },
   { label: "head → rtk read", match: re(/^head\s+(-\d+|--lines=\d+)\s+/), rewrite: (body) => {
     let m = body.match(/^head\s+-(\d+)\s+(.+)$/);
@@ -204,7 +369,7 @@ assertEqual(splitEnvPrefix("FOO=bar ls -la")[0], "FOO=bar ", "single env var");
 assertEqual(splitEnvPrefix("FOO=bar BAZ=qux ls")[0], "FOO=bar BAZ=qux ", "multiple env vars");
 assertEqual(splitEnvPrefix("FOO=bar ls -la")[1], "ls -la", "body after env");
 
-// ── Tests: Core rewrites (matching Claude hook behavior) ─────────────────────
+// ── Tests: Core rewrites ─────────────────────────────────────────────────────
 
 console.log("=== Core rewrites ===");
 
@@ -230,24 +395,66 @@ assertEqual(tryRewriteSingle("diff a.txt b.txt")?.rewritten, "rtk diff a.txt b.t
 assertEqual(tryRewriteSingle("head -20 file.txt")?.rewritten, "rtk read file.txt --max-lines 20", "head -N");
 assertEqual(tryRewriteSingle("head --lines=50 file.txt")?.rewritten, "rtk read file.txt --max-lines 50", "head --lines=N");
 
-// Find (restored — matches Claude hook)
-assertEqual(tryRewriteSingle("find . -name '*.ts'")?.rewritten, "rtk find . -name '*.ts'", "find rewritten");
-assertEqual(tryRewriteSingle("find /tmp -type f")?.rewritten, "rtk find /tmp -type f", "find with -type");
+// ── Tests: Smart grep translation ────────────────────────────────────────────
 
-// Grep/rg — ALL patterns rewritten (matches Claude hook, no flag checking)
-assertEqual(tryRewriteSingle('grep "pattern" file')?.rewritten, 'rtk grep "pattern" file', "simple grep");
-assertEqual(tryRewriteSingle('grep -rn "pattern" dir/')?.rewritten, 'rtk grep -rn "pattern" dir/', "grep -rn rewritten");
-assertEqual(tryRewriteSingle('grep -oP "\\d+" file')?.rewritten, 'rtk grep -oP "\\d+" file', "grep -oP rewritten");
-assertEqual(tryRewriteSingle('grep -B 5 "pattern" file')?.rewritten, 'rtk grep -B 5 "pattern" file', "grep -B rewritten");
-assertEqual(tryRewriteSingle('grep --include="*.gd" "x" dir/')?.rewritten, 'rtk grep --include="*.gd" "x" dir/', "grep --include rewritten");
-assertEqual(tryRewriteSingle('rg "pattern" src/')?.rewritten, 'rtk grep "pattern" src/', "rg rewritten");
-assertEqual(tryRewriteSingle('grep -i "test" file')?.rewritten, 'rtk grep -i "test" file', "grep -i rewritten");
+console.log("=== Smart grep translation ===");
 
-// Pipes and redirects — rewritten aggressively (matches Claude hook)
+// Simple grep — positional pattern + path
+assertEqual(tryRewriteSingle('grep "pattern" file')?.rewritten, 'rtk grep pattern file', "simple grep");
+assertEqual(tryRewriteSingle('rg "pattern" src/')?.rewritten, 'rtk grep pattern src/', "rg rewritten");
+
+// -r stripped (rtk is recursive by default)
+assertEqual(tryRewriteSingle('grep -r "pattern" dir/')?.rewritten, 'rtk grep pattern dir/', "grep -r: -r stripped");
+assertEqual(tryRewriteSingle('grep -R "pattern" dir/')?.rewritten, 'rtk grep pattern dir/', "grep -R: -R stripped");
+assertEqual(tryRewriteSingle('grep --recursive "pattern" dir/')?.rewritten, 'rtk grep pattern dir/', "grep --recursive stripped");
+
+// -rn → -r stripped, -n kept
+assertEqual(tryRewriteSingle('grep -rn "pattern" dir/')?.rewritten, 'rtk grep pattern dir/ -n', "grep -rn: -r stripped, -n kept");
+
+// -i passed through
+assertEqual(tryRewriteSingle('grep -i "test" file')?.rewritten, 'rtk grep test file -i', "grep -i passed through");
+
+// -B with arg passed through
+assertEqual(tryRewriteSingle('grep -B 5 "pattern" file')?.rewritten, 'rtk grep pattern file -B 5', "grep -B 5 passed through");
+
+// -oP passed through
+assertEqual(tryRewriteSingle('grep -oP "\\d+" file')?.rewritten, 'rtk grep \\d+ file -oP', "grep -oP passed through");
+
+// --include translated to --glob
+assertEqual(tryRewriteSingle('grep --include="*.gd" "x" dir/')?.rewritten, 'rtk grep x dir/ --glob *.gd', "grep --include → --glob");
+
+// grep with pipe — shell operator split preserves the tail
+assertEqual(tryRewriteSingle("grep pattern file | sort")?.rewritten, "rtk grep pattern file | sort", "grep with pipe");
+
+// ── Tests: Smart find translation ────────────────────────────────────────────
+
+console.log("=== Smart find translation ===");
+
+// Basic -name extraction
+assertEqual(tryRewriteSingle("find . -name '*.ts'")?.rewritten, "rtk find *.ts .", "find -name positional");
+assertEqual(tryRewriteSingle("find /tmp -name '*.log'")?.rewritten, "rtk find *.log /tmp", "find with explicit path");
+
+// -type translated to -t
+assertEqual(tryRewriteSingle("find . -type f -name '*.gd'")?.rewritten, "rtk find *.gd . -t f", "find -type f → -t f");
+assertEqual(tryRewriteSingle("find . -type d -name 'src'")?.rewritten, "rtk find src . -t d", "find -type d → -t d");
+
+// -maxdepth stripped (not supported by rtk find)
+assertEqual(tryRewriteSingle("find . -name '*.ts' -maxdepth 2")?.rewritten, "rtk find *.ts .", "find -maxdepth stripped");
+
+// -exec → bail out (side effects)
+assert(tryRewriteSingle("find . -name '*.tmp' -exec rm {} ;") === null, "find -exec skipped");
+assert(tryRewriteSingle("find . -name '*.log' -delete") === null, "find -delete skipped");
+
+// No -name → bail out (can't extract pattern)
+assert(tryRewriteSingle("find /tmp -type f") === null, "find without -name skipped");
+
+// ── Tests: Pipes and redirects ───────────────────────────────────────────────
+
+console.log("=== Pipes and redirects ===");
+
 assertEqual(tryRewriteSingle("ls -la | wc -l")?.rewritten, "rtk ls -la | wc -l", "ls with pipe rewritten");
 assertEqual(tryRewriteSingle("git status | head -5")?.rewritten, "rtk git status | head -5", "git with pipe rewritten");
 assertEqual(tryRewriteSingle("cat file > out.txt")?.rewritten, "rtk read file > out.txt", "cat with redirect rewritten");
-assertEqual(tryRewriteSingle("grep pattern file | sort")?.rewritten, "rtk grep pattern file | sort", "grep with pipe rewritten");
 assertEqual(tryRewriteSingle("ls dir && echo done")?.rewritten, "rtk ls dir && echo done", "ls with && rewritten");
 
 // Env prefix preserved

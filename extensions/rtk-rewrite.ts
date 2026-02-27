@@ -10,7 +10,7 @@
  * Matches Claude hook behavior: aggressive rewriting, no pipe/redirect guards.
  *
  * Install:
- *   pi install git:github.com/nstefan/pi-rtk-rewrite
+ *   pi install git:github.com/nstfn/pi-rtk-rewrite
  *
  * Usage:
  *   Automatic after install — loads on every pi session.
@@ -102,6 +102,209 @@ function re(pattern: RegExp): (cmd: string) => boolean {
   return (cmd) => pattern.test(cmd);
 }
 
+/**
+ * Split a command string at the first unquoted shell operator (|, &&, ||, ;, >, >>, <, 2>).
+ * Returns [commandPart, shellTail] where shellTail includes the operator.
+ */
+function splitAtShellOp(cmd: string): [string, string] {
+  let quote: string | null = null;
+  for (let i = 0; i < cmd.length; i++) {
+    const ch = cmd[i];
+    if (quote) {
+      if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'") { quote = ch; continue; }
+    if (ch === "|" || ch === ";" || ch === ">" || ch === "<") {
+      return [cmd.slice(0, i).trimEnd(), " " + cmd.slice(i)];
+    }
+    if (ch === "&" && cmd[i + 1] === "&") {
+      return [cmd.slice(0, i).trimEnd(), " " + cmd.slice(i)];
+    }
+  }
+  return [cmd, ""];
+}
+
+/**
+ * Translate a grep/rg invocation to rtk grep positional syntax.
+ *
+ * rtk grep expects: <PATTERN> [PATH] [EXTRA_ARGS]...
+ * - Recursive by default (strip -r/-R/--recursive)
+ * - Accepts -n for compat (always on)
+ * - Passes remaining flags as EXTRA_ARGS to ripgrep
+ * - Translates --include="*.ext" to --glob "*.ext"
+ *
+ * Returns the full `rtk grep ...` command, or null if untranslatable.
+ */
+function translateGrep(body: string): string | null {
+  // Split at shell operators so we only translate the grep part
+  const [cmdPart, shellTail] = splitAtShellOp(body);
+  // Strip the leading grep/rg command
+  const rest = cmdPart.replace(/^(rg|grep)\s+/, "");
+  if (!rest) return null;
+
+  const tokens = shellTokenise(rest);
+
+  let pattern: string | null = null;
+  let path: string | null = null;
+  const extraArgs: string[] = [];
+
+  // Flags to strip (redundant in rtk grep)
+  const stripShort = new Set(["r", "R"]);
+  // Flags that consume a following argument
+  const argFlags = new Set(["-A", "-B", "-C", "-m", "-e", "-f", "--glob"]);
+
+  for (let i = 0; i < tokens.length; i++) {
+    const tok = tokens[i];
+
+    // Combined short flags like -rn, -rin, -rni
+    if (/^-[a-zA-Z]{2,}$/.test(tok) && !tok.startsWith("--")) {
+      const kept = tok.slice(1).split("").filter((ch) => !stripShort.has(ch));
+      if (kept.length > 0) extraArgs.push("-" + kept.join(""));
+      continue;
+    }
+
+    // Single short flags to strip
+    if (tok === "-r" || tok === "-R" || tok === "--recursive") continue;
+
+    // --include="*.ext" → --glob "*.ext"
+    const includeMatch = tok.match(/^--include=(.+)$/);
+    if (includeMatch) {
+      extraArgs.push("--glob", includeMatch[1]);
+      continue;
+    }
+    if (tok === "--include" && i + 1 < tokens.length) {
+      extraArgs.push("--glob", tokens[++i]);
+      continue;
+    }
+
+    // Flags with a following argument
+    if (argFlags.has(tok) && i + 1 < tokens.length) {
+      extraArgs.push(tok, tokens[++i]);
+      continue;
+    }
+
+    // Other flags (pass through)
+    if (tok.startsWith("-")) {
+      extraArgs.push(tok);
+      continue;
+    }
+
+    // Positional: first is pattern, second is path
+    if (pattern === null) {
+      pattern = tok;
+    } else if (path === null) {
+      path = tok;
+    } else {
+      // Unexpected extra positional — bail out
+      return null;
+    }
+  }
+
+  if (!pattern) return null;
+
+  const parts = ["rtk grep", pattern];
+  if (path) parts.push(path);
+  if (extraArgs.length > 0) parts.push(extraArgs.join(" "));
+  return parts.join(" ") + shellTail;
+}
+
+/**
+ * Translate a find invocation to rtk find positional syntax.
+ *
+ * rtk find expects: <PATTERN> [PATH] [-t f|d] [-m N]
+ *
+ * Extracts -name value as PATTERN, path as PATH, -type as -t.
+ * Skips commands with side-effect flags (-exec, -delete, -print0, etc.)
+ *
+ * Returns the full `rtk find ...` command, or null if untranslatable.
+ */
+function translateFind(body: string): string | null {
+  const [cmdPart, shellTail] = splitAtShellOp(body);
+
+  const rest = cmdPart.replace(/^find\s+/, "");
+  if (!rest) return null;
+
+  const tokens = shellTokenise(rest);
+
+  // Bail out on side-effect flags
+  const dangerous = new Set(["-exec", "-execdir", "-delete", "-print0", "-ok", "-fls", "-fprint"]);
+  if (tokens.some((t) => dangerous.has(t))) return null;
+
+  let namePattern: string | null = null;
+  let path: string | null = null;
+  let fileType: string | null = null;
+
+  // Flags we understand but skip (rtk doesn't support them)
+  const skipWithArg = new Set(["-maxdepth", "-mindepth"]);
+
+  for (let i = 0; i < tokens.length; i++) {
+    const tok = tokens[i];
+
+    if (tok === "-name" || tok === "-iname") {
+      if (i + 1 < tokens.length) namePattern = tokens[++i];
+      continue;
+    }
+
+    if (tok === "-type" && i + 1 < tokens.length) {
+      fileType = tokens[++i];
+      continue;
+    }
+
+    if (skipWithArg.has(tok) && i + 1 < tokens.length) {
+      i++; // skip the value
+      continue;
+    }
+
+    // Other flags we don't understand — bail out
+    if (tok.startsWith("-")) return null;
+
+    // Positional: the search path (first non-flag, non-extracted arg)
+    if (path === null) {
+      path = tok;
+    }
+  }
+
+  if (!namePattern) return null;
+
+  const parts = ["rtk find", namePattern];
+  if (path) parts.push(path);
+  if (fileType === "f" || fileType === "d") parts.push("-t", fileType);
+  return parts.join(" ") + shellTail;
+}
+
+/**
+ * Simple shell tokeniser — splits on whitespace, respects single/double quotes.
+ */
+function shellTokenise(input: string): string[] {
+  const tokens: string[] = [];
+  let current = "";
+  let quote: string | null = null;
+
+  for (let i = 0; i < input.length; i++) {
+    const ch = input[i];
+
+    if (quote) {
+      if (ch === quote) {
+        quote = null;
+      } else {
+        current += ch;
+      }
+    } else if (ch === '"' || ch === "'") {
+      quote = ch;
+    } else if (ch === " " || ch === "\t") {
+      if (current) {
+        tokens.push(current);
+        current = "";
+      }
+    } else {
+      current += ch;
+    }
+  }
+  if (current) tokens.push(current);
+  return tokens;
+}
+
 // ── Rewrite Rules ────────────────────────────────────────────────────────────
 // Each rule is tested in order; the first match wins.
 // Matches Claude CLI hook behavior: aggressive rewriting for maximum token savings.
@@ -158,7 +361,7 @@ const rules: RewriteRule[] = [
   {
     label: "grep/rg",
     match: re(/^(rg|grep)\s+/),
-    rewrite: (body) => body.replace(/^(rg|grep) /, "rtk grep "),
+    rewrite: (body) => translateGrep(body) ?? body,
   },
   {
     label: "ls",
@@ -173,7 +376,7 @@ const rules: RewriteRule[] = [
   {
     label: "find",
     match: re(/^find\s+/),
-    rewrite: (body) => body.replace(/^find /, "rtk find "),
+    rewrite: (body) => translateFind(body) ?? body,
   },
   {
     label: "diff",

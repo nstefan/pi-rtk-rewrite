@@ -87,7 +87,11 @@ ls -la              → rtk ls -la
 | `git status` | `rtk git status` | ✅ One-line compact output |
 | `git log --oneline -5` | `rtk git log --oneline -5` | ✅ |
 | `git diff --stat HEAD~1` | `rtk git diff --stat HEAD~1` | ✅ |
-| `grep "extends" file.gd` | `rtk grep "extends" file.gd` | ✅ Formatted with file grouping |
+| `grep "extends" file.gd` | `rtk grep extends file.gd` | ✅ Formatted with file grouping |
+| `grep -rn "pattern" dir/` | `rtk grep pattern dir/ -n` | ✅ `-r` stripped, args reordered |
+| `grep --include="*.gd" "x" dir/` | `rtk grep x dir/ --glob *.gd` | ✅ `--include` → `--glob` |
+| `find . -name "*.ts"` | `rtk find *.ts .` | ✅ `-name` extracted to positional |
+| `find . -type f -name "*.gd"` | `rtk find *.gd . -t f` | ✅ `-type` → `-t` |
 | `curl -s <url>` | `rtk curl -s <url>` | ✅ Compact JSON |
 | `FOO=bar git status` | `FOO=bar rtk git status` | ✅ Env prefix preserved |
 | `rtk gain` | `rtk gain` (unchanged) | ✅ No double-rewrite |
@@ -95,15 +99,11 @@ ls -la              → rtk ls -la
 | Multi-line block | Each line rewritten independently | ✅ Comments preserved |
 
 ## Known limitations
-
-The extension rewrites correctly in all cases below — the errors come from flag-syntax mismatches between native CLI tools and their `rtk` equivalents:
-
+The extension translates `grep`/`find` flags to rtk's positional syntax (stripping `-r`, reordering args, converting `--include` → `--glob`, extracting `-name` patterns). Most common invocations work. Remaining edge cases:
 | Pi bash tool call | Issue | Workaround |
 |-------------------|-------|------------|
-| `grep -rn "pattern" dir/` | `rtk grep` doesn't accept `-r`, `-n`, or combined flags like `-rn` | Use positional syntax: `grep "pattern" dir/` (rtk searches recursively by default) |
-| `find . -name "*.ts" -maxdepth 2` | `rtk find` uses `<PATTERN> [PATH]` positional syntax, not `-name`/`-type` flags | Use `find "*.ts" .` or prefix with `command find` to bypass |
-| `grep -oP`, `-B`, `--include` | Flags passed through but `rtk grep` may not support all of them | Use `command grep` to bypass, or check `rtk grep --help` |
-
+| `find . -exec rm {} \;` | Side-effect flags (`-exec`, `-delete`, `-print0`) — skipped by design | Passed through unchanged (no rewrite) |
+| `find /tmp -type f` (no `-name`) | Can't extract a pattern for rtk's positional syntax | Passed through unchanged |
 To bypass rewriting for a specific command:
 - Prefix with `command`: `command grep -rn "pattern" dir/`
 - Use `/rtk:toggle` to temporarily disable all rewriting
@@ -118,7 +118,7 @@ To bypass rewriting for a specific command:
 ## Development
 
 ```bash
-git clone git@github.com:nstefan/pi-rtk-rewrite.git
+git clone git@github.com:nstfn/pi-rtk-rewrite.git
 cd pi-rtk-rewrite
 
 # Test locally
