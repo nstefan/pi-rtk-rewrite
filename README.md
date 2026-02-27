@@ -78,22 +78,6 @@ ls -la              → rtk ls -la
 
 ## Real-world results
 
-Tested live inside a pi session (Godot 4.6 project, ~1,400 bash tool calls tracked):
-
-| Metric | Value |
-|--------|-------|
-| Total commands tracked | 1,418 |
-| Input tokens | 5.5M |
-| Output tokens | 1.9M |
-| **Tokens saved** | **3.6M (65.7%)** |
-| Avg exec overhead | 308ms |
-
-Top savers: `cargo test` (1.1M saved, 99.8%), `cargo clippy` (948K, 99.1%), `ls` (571K across 655 calls), `git commit` (156K, 97.3%).
-
-### Verified rewrites
-
-Each row tested live — the extension intercepted the bash tool call and rtk produced compact output:
-
 | Pi bash tool call | Rewritten to | Result |
 |-------------------|-------------|--------|
 | `ls -la` | `rtk ls -la` | ✅ Compact output with file sizes + summary |
