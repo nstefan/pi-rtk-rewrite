@@ -50,7 +50,11 @@ let rtkAvailable: boolean | null = null;
 function checkRtk(): boolean {
   if (rtkAvailable !== null) return rtkAvailable;
   try {
-    execSync("command -v rtk", { stdio: "ignore" });
+    // Use a login shell so we pick up the full user PATH.
+    // A plain execSync inherits the Node.js process environment which may
+    // have a trimmed PATH (e.g. on NixOS where per-user profile paths are
+    // only added by the login shell).
+    execSync("bash -lc 'command -v rtk'", { stdio: "ignore" });
     rtkAvailable = true;
   } catch {
     rtkAvailable = false;
